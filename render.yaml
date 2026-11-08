@@ -1,0 +1,17 @@
+# Render Blueprint - one-click deploy: https://render.com/deploy
+services:
+  - type: web
+    name: fileflip
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: TRUST_PROXY
+        value: "true"
+      - key: CONCURRENCY
+        value: "2"
