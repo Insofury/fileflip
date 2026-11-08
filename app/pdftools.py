@@ -143,9 +143,10 @@ def compress(data: bytes, name: str, level: str = "medium") -> tuple[bytes, list
 
 
 def images_to_pdf(files: list[tuple[str, bytes]], page_size: str = "A4") -> bytes:
-    """Each image on its own page (portrait or landscape to match the picture), centred."""
+    """Each image on its own page (portrait or landscape to match the picture), centred.
+    Phone photos are turned upright and every page of a multi-page TIFF is included."""
     from .compat import fpdf
-    from .model import normalize_image
+    from .readers.images import read_image
 
     FPDF = fpdf()
 
@@ -156,12 +157,14 @@ def images_to_pdf(files: list[tuple[str, bytes]], page_size: str = "A4") -> byte
     pdf.set_creator("FileFlip")
     margin = 10
     for name, data in files:
-        img = normalize_image(data, name)
-        if img is None:
-            raise ConvertError(f"{name} couldn't be read as an image.")
-        pdf.add_page(orientation="L" if img.width > img.height else "P")
-        max_w, max_h = pdf.w - 2 * margin, pdf.h - 2 * margin
-        scale = min(max_w / img.width, max_h / img.height)
-        w, h = img.width * scale, img.height * scale
-        pdf.image(io.BytesIO(img.data), x=(pdf.w - w) / 2, y=(pdf.h - h) / 2, w=w, h=h)
+        try:
+            images = read_image(data, name).images()
+        except ConvertError as exc:
+            raise ConvertError(f"{name}: {exc}") from exc
+        for img in images:
+            pdf.add_page(orientation="L" if img.width > img.height else "P")
+            max_w, max_h = pdf.w - 2 * margin, pdf.h - 2 * margin
+            scale = min(max_w / img.width, max_h / img.height)
+            w, h = img.width * scale, img.height * scale
+            pdf.image(io.BytesIO(img.data), x=(pdf.w - w) / 2, y=(pdf.h - h) / 2, w=w, h=h)
     return bytes(pdf.output())

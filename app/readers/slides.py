@@ -59,30 +59,95 @@ def _ordered(shapes):
     return sorted(shapes, key=lambda s: ((s.top or 0) // 20000, s.left or 0))
 
 
-def read_pptx(data: bytes) -> Document:
+def _read_with_python_pptx(data: bytes) -> Document:
     from pptx import Presentation
 
-    try:
-        prs = Presentation(io.BytesIO(data))
-    except Exception as exc:  # noqa: BLE001
-        raise ConvertError("This PowerPoint file couldn't be opened. It may be damaged or password-protected.") from exc
-
+    prs = Presentation(io.BytesIO(data))
     doc = Document(title=(prs.core_properties.title or "").strip())
     counters = {"skipped": 0}
     for number, slide in enumerate(prs.slides, start=1):
         if number > 1:
             doc.add(PageBreak())
-        title_shape = slide.shapes.title
-        title = title_shape.text.strip().replace("\n", " ") if title_shape is not None and title_shape.has_text_frame else ""
+        try:
+            title_shape = slide.shapes.title
+            title = title_shape.text.strip().replace("\n", " ") if title_shape is not None and title_shape.has_text_frame else ""
+        except Exception:  # noqa: BLE001
+            title_shape, title = None, ""
         doc.add(Paragraph(runs(f"Slide {number}" + (f": {title}" if title else "")), style="h2"))
         for shape in _ordered(slide.shapes):
-            _shape_blocks(shape, doc, title_shape, counters)
-        if slide.has_notes_slide:
-            notes = slide.notes_slide.notes_text_frame.text.strip() if slide.notes_slide.notes_text_frame else ""
-            if notes:
-                doc.add(Paragraph([Run("Speaker notes: ", bold=True), Run(notes)], style="quote"))
+            try:
+                _shape_blocks(shape, doc, title_shape, counters)
+            except Exception:  # noqa: BLE001 - one odd shape (chart, SmartArt, OLE) must not stop the rest
+                counters["skipped_shapes"] = counters.get("skipped_shapes", 0) + 1
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    doc.add(Paragraph([Run("Speaker notes: ", bold=True), Run(notes)], style="quote"))
+        except Exception:  # noqa: BLE001
+            pass
     if counters["skipped"]:
         doc.note(f"{counters['skipped']} picture(s) in a format FileFlip can't read were left out.")
+    if counters.get("skipped_shapes"):
+        doc.note(f"{counters['skipped_shapes']} item(s) like charts or diagrams couldn't be converted.")
+    return doc
+
+
+# ------------------------------------------------------------------ fallback
+P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _read_with_xml(data: bytes) -> Document:
+    """Read slide text straight from the XML (works for .pptm/.ppsx/.potx and files
+    python-pptx refuses)."""
+    import posixpath
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        pres = ET.fromstring(zf.read("ppt/presentation.xml"))
+        rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(zf.read("ppt/_rels/presentation.xml.rels"))}
+    except (zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
+        raise ConvertError("This PowerPoint file couldn't be opened. It may be damaged or password-protected.") from exc
+    slide_ids = pres.find(P + "sldIdLst")
+    paths = [posixpath.normpath(posixpath.join("ppt", rels.get(s.get(REL + "id"), ""))) for s in (slide_ids if slide_ids is not None else [])]
+    doc = Document()
+    for number, path in enumerate(paths, start=1):
+        try:
+            root = ET.fromstring(zf.read(path))
+        except (KeyError, ET.ParseError):
+            continue
+        if number > 1:
+            doc.add(PageBreak())
+        title, body = "", []
+        for sp in root.iter(P + "sp"):
+            ph = sp.find(f"{P}nvSpPr/{P}nvPr/{P}ph")
+            is_title = ph is not None and ph.get("type") in ("title", "ctrTitle")
+            for p in sp.iter(A + "p"):
+                text = "".join(t.text or "" for t in p.iter(A + "t")).strip()
+                if not text:
+                    continue
+                if is_title and not title:
+                    title = text
+                else:
+                    ppr = p.find(A + "pPr")
+                    body.append((text, int(ppr.get("lvl", "0")) if ppr is not None else 0))
+        doc.add(Paragraph(runs(f"Slide {number}" + (f": {title}" if title else "")), style="h2"))
+        for text, level in body:
+            doc.add(ListItem([Run(text)], level=min(level, 3)))
+    return doc
+
+
+def read_pptx(data: bytes) -> Document:
+    try:
+        doc = _read_with_python_pptx(data)
+    except Exception:  # noqa: BLE001 - e.g. .pptm content types or odd XML: read it directly
+        doc = _read_with_xml(data)
+        doc.note("This file was read in a simpler way, so pictures, tables and notes may be missing.")
     if not doc.blocks:
         raise ConvertError("This presentation has no slides.")
     return doc

@@ -19,6 +19,9 @@ MUTED = (96, 108, 112)
 ACCENT = (47, 111, 102)
 LINK = (31, 95, 168)
 MARGIN = 20  # mm
+LANDSCAPE_COLUMNS = 8  # tables wider than this get a landscape page
+MAX_TABLE_COLUMNS = 30  # wider than this can't be read on paper: written as text lines
+MAX_CELL_CHARS = 1500
 
 
 def _make_pdf(page_size: str, title: str):
@@ -52,6 +55,7 @@ class _Writer:
         self.pdf = _make_pdf(page_size, doc.title)
         self.numbers: dict[int, int] = {}  # list level -> current number
         self.prev = None
+        self.landscape = False
 
     # ------------------------------------------------ text helpers
     def font(self, run: Run | None, size: float, style_bold: bool = False) -> None:
@@ -138,29 +142,52 @@ class _Writer:
         if not block.rows:
             return
         width = max(len(r) for r in block.rows)
-        rows = [r + [""] * (width - len(r)) for r in block.rows]
-        size = max(6.5, 9.5 - max(0, width - 5) * 0.4)
+        if width > MAX_TABLE_COLUMNS:  # far too wide for a page: list the rows as text instead
+            self.table_as_text(block.rows)
+            return
+        if width > LANDSCAPE_COLUMNS and not self.landscape:
+            pdf.add_page(orientation="L")  # wide tables get a landscape page
+            self.landscape = True
+        # Very long cells would make a row taller than a page; trim them.
+        rows = [[(c if len(c) <= MAX_CELL_CHARS else c[: MAX_CELL_CHARS - 1] + "…") for c in r + [""] * (width - len(r))] for r in block.rows]
+        size = max(6.5, 9.5 - max(0, width - 5) * 0.35)
         pdf.set_font("Body", size=size)
+        pdf.set_text_color(*INK)
         pdf.set_draw_color(214, 220, 216)
         pdf.set_line_width(0.2)
         pdf.ln(1)
         from fpdf.fonts import FontFace
 
         heading = FontFace(emphasis="BOLD", color=INK, fill_color=(231, 240, 237))
-        with pdf.table(
-            width=pdf.epw,
-            line_height=size * 0.55,
-            text_align="LEFT",
-            first_row_as_headings=block.header,
-            headings_style=heading,
-            borders_layout="SINGLE_TOP_LINE" if not block.header else "HORIZONTAL_LINES",
-            padding=1.2,
-        ) as table:
-            for row in rows:
-                cells = table.row()
-                for value in row:
-                    cells.cell(value)
+        try:
+            with pdf.table(
+                width=pdf.epw,
+                line_height=size * 0.55,
+                text_align="LEFT",
+                first_row_as_headings=block.header and len(rows) > 1,
+                headings_style=heading,
+                borders_layout="SINGLE_TOP_LINE" if not block.header else "HORIZONTAL_LINES",
+                padding=1.2,
+            ) as table:
+                for row in rows:
+                    cells = table.row()
+                    for value in row:
+                        cells.cell(value)
+        except Exception:  # noqa: BLE001 - e.g. a row taller than a page: fall back to text
+            pdf.add_page()
+            self.table_as_text(rows)
         pdf.ln(4)
+
+    def table_as_text(self, rows: list[list[str]]) -> None:
+        pdf = self.pdf
+        pdf.set_font("Body", size=9)
+        pdf.set_text_color(*INK)
+        for row in rows:
+            text = "  ·  ".join(c for c in row if c.strip())
+            if text:
+                pdf.multi_cell(0, 4.6, text, new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(1)
+        self.doc.note("A very wide table was written as lines of text so it fits the page.")
 
     def image(self, block: Image) -> None:
         pdf = self.pdf
@@ -176,22 +203,47 @@ class _Writer:
         pdf.ln(4)
 
     def run(self) -> bytes:
+        failed = 0
         for block in self.doc.blocks:
             if not isinstance(block, ListItem):
                 self.numbers = {}
-            if isinstance(block, Paragraph):
-                self.paragraph(block)
-            elif isinstance(block, ListItem):
-                self.list_item(block)
-            elif isinstance(block, Table):
-                self.table(block)
-            elif isinstance(block, Image):
-                self.image(block)
-            elif isinstance(block, PageBreak):
-                if not isinstance(self.prev, PageBreak):
-                    self.pdf.add_page()
+            if self.landscape and not isinstance(block, (Table, PageBreak)):
+                self.pdf.add_page(orientation="P")  # back to portrait after a wide table
+                self.landscape = False
+            try:
+                if isinstance(block, Paragraph):
+                    self.paragraph(block)
+                elif isinstance(block, ListItem):
+                    self.list_item(block)
+                elif isinstance(block, Table):
+                    self.table(block)
+                elif isinstance(block, Image):
+                    self.image(block)
+                elif isinstance(block, PageBreak):
+                    if not isinstance(self.prev, PageBreak):
+                        self.pdf.add_page(orientation="P")
+                        self.landscape = False
+            except Exception:  # noqa: BLE001 - one odd block must never stop the whole file
+                failed += 1
+                self.plain_fallback(block)
             self.prev = block
+        if failed:
+            self.doc.note(f"{failed} part(s) of the document were written in a simpler style.")
         return bytes(self.pdf.output())
+
+    def plain_fallback(self, block) -> None:
+        pdf = self.pdf
+        try:
+            pdf.set_left_margin(MARGIN)
+            pdf.set_x(MARGIN)
+            pdf.set_font("Body", size=SIZES["normal"])
+            pdf.set_text_color(*INK)
+            if isinstance(block, (Paragraph, ListItem)):
+                pdf.multi_cell(0, 5.2, text_of(block.runs), new_x="LMARGIN", new_y="NEXT")
+            elif isinstance(block, Image):
+                self.doc.note("A picture couldn't be added to the PDF and was left out.")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _check_characters(doc: Document) -> None:

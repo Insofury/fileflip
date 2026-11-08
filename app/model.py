@@ -11,6 +11,7 @@ gives N x M conversions without writing each pair by hand:
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass, field
 from typing import Union
 
@@ -139,7 +140,104 @@ def strip_runs(run_list: list[Run]) -> list[Run]:
     return [r for r in run_list if r.text]
 
 
+
+
+# Characters Word/Excel/XML can't store: C0 controls (except tab and newline), lone
+# surrogates and the "non-characters" U+FFFE/U+FFFF.
+_INVALID_XML = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff￾￿]")
+_ZERO_WIDTH = re.compile("[​‌‎‏⁠﻿­]")  # invisible; break PDF fonts
+
+
+def clean_text(text: str) -> str:
+    """Make any text safe for every writer: normalise line breaks, turn vertical tabs
+    and form feeds into line breaks, drop invisible and invalid characters."""
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0b", "\n").replace("\x0c", "\n")
+    text = _INVALID_XML.sub("", text)
+    return _ZERO_WIDTH.sub("", text)
+
+
+def sanitize(doc: Document) -> Document:
+    """Clean every piece of text in a document (called once after reading)."""
+    for block in doc.blocks:
+        if isinstance(block, (Paragraph, ListItem)):
+            block.runs = [
+                Run(clean_text(r.text), r.bold, r.italic, r.underline, r.code, (clean_text(r.link) or None) if r.link else None)
+                for r in block.runs
+            ]
+            block.runs = [r for r in block.runs if r.text]
+        elif isinstance(block, Table):
+            block.rows = [[clean_text(str(c)) for c in row] for row in block.rows]
+            width = max((len(r) for r in block.rows), default=0)
+            block.rows = [r + [""] * (width - len(r)) for r in block.rows if width]
+            block.name = clean_text(block.name)
+    doc.blocks = [
+        b for b in doc.blocks
+        if not (isinstance(b, (Paragraph, ListItem)) and not b.runs) and not (isinstance(b, Table) and not b.rows)
+    ]
+    doc.title = clean_text(doc.title).replace("\n", " ").strip()
+    return doc
+
+
 MAX_IMAGE_SIDE = 3000  # keep embedded images a sensible size
+MAX_SOURCE_PIXELS = 120_000_000  # refuse to decode absurdly large images (memory)
+
+
+def open_image_frames(data: bytes, all_frames: bool = False) -> list:
+    """Decode an image with Pillow, upright (phone photos store their rotation in EXIF).
+    Multi-page TIFFs (scans) give one image per page when `all_frames` is set.
+    Returns [] if the data isn't an image Pillow can read."""
+    from PIL import Image as PILImage
+    from PIL import ImageOps, ImageSequence
+
+    try:
+        img = PILImage.open(io.BytesIO(data))
+        if img.width * img.height > MAX_SOURCE_PIXELS:
+            return []
+        frames = []
+        sequence = ImageSequence.Iterator(img) if all_frames and (img.format or "").upper() == "TIFF" else [img]
+        for frame in sequence:
+            frame.load()
+            frames.append(ImageOps.exif_transpose(frame.copy()) or frame.copy())
+        return frames
+    except Exception:  # noqa: BLE001 - unreadable or damaged images are reported by the caller
+        return []
+
+
+def _to_8bit(img):
+    """16/32-bit greyscale (scientific PNGs, some scans) -> 8-bit, keeping the contrast."""
+    if img.mode.startswith("I") or img.mode == "F":
+        img = img.convert("I") if img.mode != "F" else img
+        lo, hi = img.getextrema()
+        scale = 255 / (hi - lo) if hi > lo else 1
+        return img.point(lambda v: (v - lo) * scale).convert("L")
+    return img
+
+
+def encode_image(img, name: str = "", original: bytes | None = None, fmt: str = "") -> Image:
+    """A decoded Pillow image -> PNG or JPEG bytes ready for Word and PDF."""
+    fmt = fmt.upper()
+    if (  # already a small, standard PNG/JPEG: keep the original bytes untouched
+        original is not None
+        and fmt in ("PNG", "JPEG")
+        and max(img.size) <= MAX_IMAGE_SIDE
+        and img.mode in ("RGB", "RGBA", "L", "P", "LA")
+    ):
+        return Image(data=original, mime=f"image/{fmt.lower()}", width=img.width, height=img.height, name=name)
+    img = _to_8bit(img)
+    if max(img.size) > MAX_IMAGE_SIDE:
+        img = img.copy()
+        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+    buf = io.BytesIO()
+    if has_alpha:
+        img.convert("RGBA").save(buf, "PNG", optimize=img.width * img.height <= 2_500_000)
+        mime = "image/png"
+    else:
+        img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True)
+        mime = "image/jpeg"
+    return Image(data=buf.getvalue(), mime=mime, width=img.width, height=img.height, name=name)
 
 
 def normalize_image(data: bytes, name: str = "") -> Image | None:
@@ -147,22 +245,16 @@ def normalize_image(data: bytes, name: str = "") -> Image | None:
     Returns None for formats Pillow can't read (e.g. EMF/WMF drawings)."""
     from PIL import Image as PILImage
 
-    try:
-        img = PILImage.open(io.BytesIO(data))
-        img.load()
-    except Exception:  # noqa: BLE001 - unreadable image formats are skipped with a note
+    frames = open_image_frames(data)
+    if not frames:
         return None
-    fmt = (img.format or "").upper()
-    if fmt in ("PNG", "JPEG") and max(img.size) <= MAX_IMAGE_SIDE and img.mode in ("RGB", "RGBA", "L", "P", "LA"):
-        return Image(data=data, mime=f"image/{fmt.lower()}", width=img.width, height=img.height, name=name)
-    if max(img.size) > MAX_IMAGE_SIDE:
-        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
-    has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
-    buf = io.BytesIO()
-    if has_alpha:
-        img.convert("RGBA").save(buf, "PNG", optimize=True)
-        mime = "image/png"
-    else:
-        img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True)
-        mime = "image/jpeg"
-    return Image(data=buf.getvalue(), mime=mime, width=img.width, height=img.height, name=name)
+    try:
+        raw = PILImage.open(io.BytesIO(data))
+        fmt = raw.format or ""
+        rotated = raw.getexif().get(0x0112, 1) not in (None, 1)  # then re-encode the upright copy
+    except Exception:  # noqa: BLE001
+        fmt, rotated = "", True
+    try:
+        return encode_image(frames[0], name, None if rotated else data, fmt)
+    except Exception:  # noqa: BLE001 - an image we can't re-encode is skipped with a note
+        return None

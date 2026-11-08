@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -59,6 +59,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.add_middleware(SecurityHeadersMiddleware)
     logger.info("FileFlip v%s starting", __version__)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        """Last line of defence: log the details, show the user a calm message."""
+        logger.exception("Unexpected error on %s", request.url.path)
+        return JSONResponse({"detail": "Something went wrong on our side. Please try again."}, status_code=500)
 
     def limit(request: Request) -> None:
         allowed, retry_after = limiter.hit(client_ip(request, settings.trust_proxy))

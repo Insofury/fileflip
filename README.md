@@ -52,6 +52,37 @@ uploaded anywhere.
 **PDF → Word** works on PDFs that contain text, which is most of them. Scanned pages are
 only pictures, so they need OCR first; FileFlip keeps the pictures and tells you.
 
+### Built for real-world files
+
+**PDFs**
+- PDFs made with **Canva** and other design tools (text inside "form" objects).
+- Bullets drawn as small shapes, letter-spaced titles ("R E S U M E").
+- Superscript ordinals (10<sup>th</sup>), side-by-side columns, and bullet points split
+  across text boxes.
+
+**Office files**
+- Word **content controls, text boxes, equations and tracked changes**.
+- Macro-enabled and template files: `.docm`, `.dotx`, `.pptm`, `.ppsx`, `.potx`, `.xlsm`,
+  `.xltx`.
+
+**Images**
+- Phone photos come out **upright**.
+- **Multi-page TIFF** scans.
+- CMYK and 16-bit images.
+
+**Odd text**
+- Control characters, very long cells, wide tables (they get a landscape page), and
+  formula-like text in spreadsheets (kept as text).
+
+**When the main reader can't cope:**
+- Every reader has a **fallback**: pypdf for PDFs, raw XML for Word and PowerPoint, and a
+  second mode for Excel.
+- Writers fall back to plain text for anything they can't format.
+- So you get a file, plus a note about anything that was simplified, instead of an error.
+
+**Never-crash tests:** the tests feed damaged versions of every file type to every output
+and check that each one gives either a result or a clear message.
+
 ## Two ways to run it
 
 | | Browser version (GitHub Pages) | Server version (FastAPI) |
@@ -148,7 +179,7 @@ fileflip/
 │   └── config.py       settings from environment variables
 ├── static/             HTML, CSS and vanilla JS (engine.js, worker.js, zip.js)
 ├── scripts/build_pages.py   builds the GitHub Pages site into _site/
-├── tests/              90 pytest tests
+├── tests/              111 pytest tests (incl. damaged-file "never crash" tests)
 └── docs/PROJECT_NOTES.md    full module-by-module guide
 ```
 

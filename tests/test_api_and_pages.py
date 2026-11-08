@@ -111,7 +111,7 @@ def test_browser_modules_avoid_server_libraries():
     """Code shipped to the browser must not import FastAPI or other server-only packages."""
     allowed = {
         "__future__", "base64", "csv", "dataclasses", "datetime", "functools", "html", "http", "io", "json", "os",
-        "pathlib", "re", "typing", "urllib", "zipfile", "collections",
+        "pathlib", "re", "typing", "urllib", "zipfile", "collections", "xml", "posixpath", "heapq",
         "PIL", "docx", "pptx", "openpyxl", "pdfminer", "pypdf", "fpdf", "fontTools", "markdown",
     }
     for rel in browser_modules():

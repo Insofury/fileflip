@@ -1,8 +1,8 @@
 // FileFlip front-end: picking files, choosing a format, running conversions and PDF
 // tools, and showing the results.
 
-import { createEngine } from "./engine.js?v=1.0.0";
-import { makeZip } from "./zip.js?v=1.0.0";
+import { createEngine } from "./engine.js?v=1.1.0";
+import { makeZip } from "./zip.js?v=1.1.0";
 
 const $ = (id) => document.getElementById(id);
 

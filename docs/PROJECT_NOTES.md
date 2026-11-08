@@ -122,7 +122,7 @@ fileflip/
 │   └── main.py            FastAPI app
 ├── static/                index.html, css/styles.css, js/{app,engine,worker,zip,theme}.js
 ├── scripts/build_pages.py GitHub Pages build
-├── tests/                 90 tests (samples.py builds every file type in memory)
+├── tests/                 111 tests (samples.py builds every file type in memory)
 └── docs/                  these notes + screenshots
 ```
 
@@ -148,37 +148,65 @@ message.
 A PDF has no paragraphs or headings: only characters placed at positions on a page. The
 reader rebuilds the structure the way a person reads it:
 
-1. **Layout:** `pdfminer.six` groups characters into lines and text boxes in reading order
-   (`LAParams(line_margin=0.6, boxes_flow=0.5)`).
+1. **Layout:** `pdfminer.six` groups characters into lines and text boxes
+   (`LAParams(line_margin=0.6, boxes_flow=0.5, all_texts=True)`).
+   - **Figures:** Canva, design tools and some print drivers wrap whole pages (or blocks)
+     in *form XObjects*. pdfminer reports them as figures, and `all_texts=True` lays out
+     the text inside them too.
+   - `_collect` walks into figures, keeping each figure's boxes as a group.
+   - `_merge_groups` starts from the biggest group and inserts every other group as a
+     whole where its top edge falls, so a summary or sidebar in its own figure lands in
+     the right place.
+   - *(This was the bug behind "no text" on a Canva CV: every word was inside a figure.)*
 2. **Body size:** the most common character size across the document is the body text.
-3. **Segments:** each box is split wherever the font size changes, a bullet starts, or a
-   short all-bold line is followed by normal text (a heading sitting on top of its
-   paragraph).
-4. **Headings:**
+3. **Line clean-up:**
+   - Letter-spaced titles become words: `A S H I S H   C H A H A R` → `ASHISH CHAHAR`.
+   - Doubled spaces from justified text are collapsed.
+   - Unreadable `(cid:123)` glyphs are removed, with a note.
+4. **Superscripts:** ordinals that pdfminer splits off ("10" + small raised "th") are put
+   back after their number:
+   - when they sit on the same line (`_line`);
+   - when they're in a line of their own (`_superscripts`).
+5. **Segments:** each box is split into blocks wherever:
+   - the font size changes;
+   - a bullet starts: a bullet character, or a **small drawn dot or square** just left of
+     the line (many designed CVs draw bullets as shapes);
+   - a short all-bold line is followed by normal text (a heading on top of its paragraph);
+   - a line ends a sentence well short of the box width (end of a paragraph);
+   - there's a vertical gap.
+6. **Headings:**
    - text ≥ 1.6× the body size is `h1`, ≥ 1.3× is `h2`;
    - short, slightly larger or all-bold lines without a full stop are `h3`.
-5. **Formatting:** bold and italic come from font names (`Arial-BoldMT`, `Times-Italic`),
+7. **Formatting:** bold and italic come from font names (`Arial-BoldMT`, `Times-Italic`),
    kept per run.
-6. **Lists:**
-   - lines starting with `•`, `-`, `1.` or `a)` become list items;
-   - the nesting level comes from how far each item is indented compared with the
-     leftmost item on the page.
-7. **Joining lines:** lines are joined with spaces, and end-of-line hyphenation is undone
+8. **Lists:**
+   - **Nesting:** within each run of consecutive items, an item indented further than the
+     previous one goes one level deeper (`_set_list_levels`).
+   - **Continuations:** a plain line right under a bullet point, starting where its text
+     starts, is joined to it.
+9. **Joining lines:** lines are joined with spaces, and end-of-line hyphenation is undone
    (`exam-` + `ple` = `example`).
-8. **Page numbers:** short number-only text ("3", "Page 3 of 9") in the top or bottom 8%
-   of a page is dropped.
-9. **Tables:** `_find_tables` looks for short text boxes that line up into at least
-   2 rows × 2 columns:
-   - the rows are boxes whose tops are at the same height;
-   - neighbouring rows must have matching column positions and be close together;
-   - cells are placed in the nearest column.
-10. **Pictures:**
+10. **Page numbers:** short number-only text ("3", "Page 3 of 9") in the top or bottom 8%
+    of a page is dropped.
+11. **Tables:** `_find_tables` looks for short text boxes that line up into at least
+    2 rows × 2 columns:
+    - the rows are boxes whose tops are at the same height;
+    - cells that overlap within a row are merged;
+    - neighbouring rows must have cells that **overlap horizontally**, so indented
+      (bulleted) cells still line up, and must be close together.
+12. **Pictures:**
     - pypdf extracts each image (it handles JPEG, Flate, masks and CMYK);
     - pdfminer knows each image's name and position;
     - each picture is inserted before the first text box that starts below its top edge.
-11. **Scans:** a PDF without any text keeps its pictures and gets a note suggesting OCR.
-12. **Errors:** password-protected or damaged files produce clear messages. Only the first
-    400 pages are converted.
+13. **Fallback:** if pdfminer fails, or finds no text, pypdf's own text extraction is
+    tried. The result has paragraphs and lists, plus a note that headings and tables may
+    be plain text.
+14. **Scans and outlines:**
+    - A PDF without text keeps its pictures and gets a note suggesting OCR.
+    - With no text and no pictures, the message explains that the text was probably saved
+      as shapes.
+15. **Errors:** password-protected files produce a clear message. Only the first 400 pages
+    are converted.
 
 ### 4.3 `readers/word.py`
 
@@ -194,6 +222,28 @@ Walks the body XML in order, so paragraphs and tables stay interleaved:
 - **Pictures:** found through `a:blip/@r:embed` relationships. EMF/WMF drawings Pillow
   can't read are counted in a note.
 - **Page breaks:** `<w:br w:type="page">`.
+- **Text python-docx's simple API skips** (`_runs`, `_Reader.walk`):
+  - content controls (`w:sdt`, both whole blocks and inline);
+  - text boxes (`w:txbxContent`, skipping the duplicate `mc:Fallback` copy kept for old
+    Word versions);
+  - tracked insertions (`w:ins`), with tracked deletions left out;
+  - smart tags, simple fields, and equations (`m:oMath`, as italic text).
+- **Robustness:**
+  - A paragraph or table python-docx can't handle falls back to its raw text.
+  - If python-docx can't open the file at all (`.docm`, `.dotx` or odd XML),
+    `_read_with_xml` reads the main part with the standard library's `ElementTree`. It
+    finds that part through `[Content_Types].xml` and keeps headings, lists, tables and
+    page breaks.
+
+PowerPoint works the same way:
+- every shape is converted on its own, so one chart or diagram that fails can't stop
+  the rest;
+- if python-pptx refuses the file, the slide text is read straight from the XML, in
+  slide order.
+
+Excel:
+- read-only mode first (fast);
+- then normal mode if that finds nothing, because some files misreport their size.
 
 ### 4.4 `readers/slides.py`
 
@@ -424,7 +474,7 @@ work.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 90 tests
+pytest -q          # 111 tests
 ```
 
 | File | Covers |
@@ -433,10 +483,33 @@ pytest -q          # 90 tests
 | `test_readers.py` | detection (incl. wrong extensions, legacy formats), each reader's structure: headings, runs, nested lists, tables, pictures, notes, page breaks, PDF table/heading/list rebuilding, scans, damaged files |
 | `test_convert.py` | **every input × every target**, round trips (Word → PDF → Word keeps text, table and picture), Excel ⇄ CSV with numbers vs IDs, text/Markdown output, missing-character notes, image conversions, file names, all PDF tools and their error messages |
 | `test_api_and_pages.py` | API routes, headers, Unicode file names, limits, rate limiting, CSP, the Pyodide entry points, the Pages build, and a guard that browser modules never import server-only libraries |
+| `test_robustness.py` | Canva-style PDFs (text in figures), drawn bullets, letter spacing, superscripts, pypdf fallback, PDFs with no text, Word content controls / text boxes / equations / tracked changes, .docm and .pptm, rotated photos, multi-page TIFF, CMYK and 16-bit images, control characters, formula-like cells, wide and huge tables, and damaged versions of every file type |
 
 ---
 
-## 11. Limitations and ideas
+## 11. Robustness: "never show a crash"
+
+Every layer has a safety net, so users get a file (with notes about anything simplified)
+or a clear message, never a stack trace:
+
+| Layer | Safety net |
+|---|---|
+| Readers | Fallback readers: pypdf for PDF, raw XML for Word/PowerPoint, a second mode for Excel. Per-shape and per-paragraph `try` blocks. |
+| Model | `sanitize()` cleans every string once after reading. It drops characters Word/Excel/XML can't store and invisible zero-width marks, and turns `\v`/`\f` into line breaks. |
+| Images | `open_image_frames()` applies EXIF rotation, reads every page of a TIFF, and refuses images over 120 MP instead of running out of memory. `_to_8bit()` handles 16-bit. CMYK and palette images are converted. |
+| PDF writer | Tables wider than 8 columns get a landscape page; wider than 30 become text lines. Long cells are trimmed. Any block that fails is written as plain text. |
+| Word writer | Tables are built row by row (fast for big sheets); any block that fails becomes plain text. |
+| Excel writer | Cells are capped at Excel's 32,767 characters. Text that looks like a formula (`=1+1`) is stored as text. |
+| `convert()` / `run_tool()` | Unexpected exceptions become a `ConvertError` naming the problem; `MemoryError` gets a "too big" message. |
+| API | A last-resort exception handler logs the details and returns a calm JSON message. |
+
+`tests/test_robustness.py` covers:
+- the real-world cases above, including the Canva-style CV layout rebuilt synthetically:
+  form XObjects, drawn bullets, letter spacing, superscripts;
+- **damaged versions of every sample** (cut short, zero-filled, scrambled) converted to
+  **every target**: each must either succeed or raise a `ConvertError`.
+
+## 12. Limitations and ideas
 
 - **Scanned PDFs** need OCR (e.g. Tesseract) to get editable text.
 - **PDF → Word** rebuilds structure, not exact layout: multi-column magazines and complex

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 
-from ..model import Document, Image, ListItem, PageBreak, Paragraph, Run, Table
+from ..model import Document, Image, ListItem, PageBreak, Paragraph, Run, Table, text_of
 
 STYLES = {"title": "Title", "h1": "Heading 1", "h2": "Heading 2", "h3": "Heading 3", "quote": "Quote"}
 PAGE_SIZES_MM = {"A4": (210, 297), "Letter": (215.9, 279.4)}
@@ -60,7 +60,8 @@ def write_docx(doc: Document, page_size: str = "A4") -> bytes:
         out.core_properties.title = doc.title
 
     align = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "justify": WD_ALIGN_PARAGRAPH.JUSTIFY}
-    for block in doc.blocks:
+
+    def write_block(block) -> None:
         if isinstance(block, Paragraph):
             if block.style == "code":
                 p = out.add_paragraph()
@@ -68,7 +69,7 @@ def write_docx(doc: Document, page_size: str = "A4") -> bytes:
                     r = p.add_run(line_run.text)
                     r.font.name = "Consolas"
                     r.font.size = Pt(9.5)
-                continue
+                return
             p = out.add_paragraph(style=STYLES.get(block.style))
             _add_runs(p, block.runs)
             if block.align in align:
@@ -80,26 +81,37 @@ def write_docx(doc: Document, page_size: str = "A4") -> bytes:
             _add_runs(p, block.runs)
         elif isinstance(block, Table):
             if not block.rows:
-                continue
+                return
             width = max(len(r) for r in block.rows)
-            table = out.add_table(rows=len(block.rows), cols=width)
+            table = out.add_table(rows=0, cols=width)
             table.style = "Table Grid"
             for i, row in enumerate(block.rows):
+                cells = table.add_row().cells  # row by row: fast even for big sheets
                 for j in range(width):
-                    cell = table.cell(i, j)
-                    cell.text = row[j] if j < len(row) else ""
+                    cells[j].text = row[j] if j < len(row) else ""
                     if i == 0 and block.header:
-                        for r in cell.paragraphs[0].runs:
+                        for r in cells[j].paragraphs[0].runs:
                             r.bold = True
             out.add_paragraph()
         elif isinstance(block, Image):
             width_in = min(block.width / 96, usable_inches)
-            try:
-                out.add_picture(io.BytesIO(block.data), width=Inches(width_in))
-            except Exception:  # noqa: BLE001 - skip a picture Word can't take rather than fail
-                doc.note("A picture couldn't be added to the Word file and was left out.")
+            out.add_picture(io.BytesIO(block.data), width=Inches(width_in))
         elif isinstance(block, PageBreak):
             out.add_page_break()
+
+    failed = 0
+    for block in doc.blocks:
+        try:
+            write_block(block)
+        except Exception:  # noqa: BLE001 - one odd block must never stop the whole file
+            failed += 1
+            if isinstance(block, (Paragraph, ListItem)):
+                try:
+                    out.add_paragraph(text_of(block.runs))
+                except Exception:  # noqa: BLE001
+                    pass
+    if failed:
+        doc.note(f"{failed} part(s) couldn't be formatted exactly and were added as plain text (or left out if they were pictures).")
 
     buf = io.BytesIO()
     out.save(buf)

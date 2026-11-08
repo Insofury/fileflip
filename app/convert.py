@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 from . import pdftools
 from .formats import KINDS, OUTPUTS, TARGETS, TOOLS, detect
-from .model import ConvertError
+from .model import ConvertError, sanitize
 from .readers import read
 from .writers import write
 
@@ -75,37 +75,77 @@ def convert(data: bytes, filename: str, target: str, page_size: str = "A4") -> O
     if kind == "image" and target in ("jpg", "png", "webp"):
         return Output(f"{name}.{ext}", _convert_image(data, target), mime)
 
-    doc = read(kind, data, filename)
-    files = [(f"{name}{suffix}.{ext}", blob) for suffix, blob in write(target, doc, page_size)]
+    label = KINDS[kind]
+    try:
+        doc = sanitize(read(kind, data, filename))
+    except ConvertError:
+        raise
+    except MemoryError as exc:
+        raise ConvertError("This file is too big to convert here. Try a smaller one.", status=413) from exc
+    except Exception as exc:  # noqa: BLE001 - never show a raw crash: explain and keep the cause for debugging
+        raise ConvertError(
+            f"FileFlip couldn't read this {label} file. It may be damaged or use a feature it doesn't support yet "
+            f"({type(exc).__name__}).",
+            status=422,
+        ) from exc
+    if not doc.blocks:
+        raise ConvertError(f"There's nothing in this {label} file to convert.", status=422)
+    try:
+        files = [(f"{name}{suffix}.{ext}", blob) for suffix, blob in write(target, doc, page_size)]
+    except ConvertError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ConvertError(
+            f"FileFlip read this file but couldn't create the {OUTPUTS[target][0]} file ({type(exc).__name__}). "
+            "Try another format.",
+            status=500,
+        ) from exc
     return _bundle(files, f"{name}-{ext}.zip", mime, doc.notes)
 
 
 def _convert_image(data: bytes, target: str) -> bytes:
-    from PIL import Image, ImageOps
+    """Image -> JPG / PNG / WebP, upright, from any colour mode (CMYK, 16-bit, palette...)."""
+    from PIL import Image
 
-    try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
-        img = ImageOps.exif_transpose(img) or img
-    except Exception as exc:  # noqa: BLE001
-        raise ConvertError("This image couldn't be read. It may be damaged.") from exc
+    from .model import _to_8bit, open_image_frames
+
+    frames = open_image_frames(data)
+    if not frames:
+        raise ConvertError("This image couldn't be read. It may be damaged, or too large.")
+    img = _to_8bit(frames[0])
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+    img = img.convert("RGBA" if has_alpha else "RGB")
     buf = io.BytesIO()
-    if target == "jpg":
-        if img.mode in ("RGBA", "LA", "P"):
-            rgba = img.convert("RGBA")
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(rgba, mask=rgba.getchannel("A"))
-            img = background
-        img.convert("RGB").save(buf, "JPEG", quality=90, optimize=True, progressive=True)
-    elif target == "png":
-        img.save(buf, "PNG", optimize=img.width * img.height <= 2_500_000)
-    else:
-        img.save(buf, "WEBP", quality=85, method=2)
+    try:
+        if target == "jpg":
+            if has_alpha:
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                background.paste(img, mask=img.getchannel("A"))
+                img = background
+            img.save(buf, "JPEG", quality=90, optimize=True, progressive=True)
+        elif target == "png":
+            img.save(buf, "PNG", optimize=img.width * img.height <= 2_500_000)
+        else:
+            img.save(buf, "WEBP", quality=85, method=2)
+    except Exception as exc:  # noqa: BLE001
+        raise ConvertError(f"This image couldn't be saved as {OUTPUTS[target][0]} ({type(exc).__name__}).") from exc
     return buf.getvalue()
 
 
 def run_tool(tool: str, files: list[tuple[str, bytes]], options: dict | None = None) -> Output:
-    options = options or {}
+    """Run a PDF tool. Any unexpected problem becomes a clear ConvertError."""
+    try:
+        return _run_tool(tool, files, options)
+    except ConvertError:
+        raise
+    except MemoryError as exc:
+        raise ConvertError("These files are too big to process here. Try smaller ones.", status=413) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ConvertError(f"FileFlip couldn't finish this ({type(exc).__name__}). One of the files may be damaged.", status=422) from exc
+
+
+def _run_tool(tool: str, files: list[tuple[str, bytes]], options: dict | None = None) -> Output:
+    options = options if isinstance(options, dict) else {}
     if tool not in TOOLS:
         raise ConvertError(f"Unknown tool '{tool}'.")
     if not files:
@@ -133,7 +173,10 @@ def run_tool(tool: str, files: list[tuple[str, bytes]], options: dict | None = N
         out = [(f"{stem(name)}-{label}.pdf", blob) for label, blob in parts]
         return _bundle(out, f"{stem(name)}-split.zip", pdf_mime, [f"Split into {len(out)} file(s)."])
     if tool == "rotate":
-        angle = int(options.get("angle", 90) or 90)
+        try:
+            angle = int(float(options.get("angle", 90) or 90))
+        except (TypeError, ValueError) as exc:
+            raise ConvertError("Rotate by 90, 180 or 270 degrees.") from exc
         out = [(f"{stem(n)}-rotated.pdf", pdftools.rotate(d, n, angle, options.get("pages", "all"))) for n, d in files]
         return _bundle(out, "rotated.zip", pdf_mime, [])
     # compress

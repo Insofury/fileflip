@@ -9,14 +9,15 @@ import re
 from ..model import ConvertError, Document
 
 NUMBER = re.compile(r"^-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
+MAX_CELL = 32_767  # characters Excel allows in one cell
 
 
 def _value(text: str):
     """Turn "1,234.5" / "42" into numbers so Excel can add them up; keep everything else
     (including numbers with leading zeros, like phone numbers or IDs) as text."""
     t = text.strip()
-    if NUMBER.match(t) and not (len(t) > 1 and t.lstrip("-").startswith("0") and not t.lstrip("-").startswith("0.")):
-        plain = t.replace(",", "")
+    if len(t) <= 15 and NUMBER.match(t) and not (len(t) > 1 and t.lstrip("-").startswith("0") and not t.lstrip("-").startswith("0.")):
+        plain = t.replace(",", "")  # (more than 15 digits would lose precision in Excel - keep as text)
         try:
             return int(plain) if "." not in plain else float(plain)
         except ValueError:
@@ -48,7 +49,11 @@ def write_xlsx(doc: Document) -> bytes:
         used.add(name.lower())
         ws = wb.create_sheet(name)
         for row in table.rows:
-            ws.append([_value(c) for c in row])
+            ws.append([_value(c[:MAX_CELL]) for c in row])  # Excel's limit per cell
+            for cell in ws[ws.max_row]:
+                # Text that starts with "=" is data, not a formula (and never runs as one).
+                if cell.data_type == "f":
+                    cell.data_type = "s"
         if table.header and table.rows:
             for cell in ws[1]:
                 cell.font = Font(bold=True)

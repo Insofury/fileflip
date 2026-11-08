@@ -37,13 +37,30 @@ def _trim(rows: list[list[str]]) -> list[list[str]]:
 
 
 def read_xlsx(data: bytes) -> Document:
-    import openpyxl
-
+    """Read-only mode is fast and light, but trusts the size the file says it has - some
+    files written by other programs get that wrong. If it finds nothing (or fails), read
+    the workbook normally."""
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        doc = _read_xlsx(data, read_only=True)
+        if doc.tables():
+            return doc
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        doc = _read_xlsx(data, read_only=False)
+    except ConvertError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise ConvertError("This Excel file couldn't be opened. It may be damaged or password-protected.") from exc
+    if not doc.tables():
+        raise ConvertError("This spreadsheet is empty.")
+    return doc
 
+
+def _read_xlsx(data: bytes, read_only: bool) -> Document:
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=read_only, data_only=True)
     doc = Document(title=(wb.properties.title or "").strip() if wb.properties else "")
     sheets = wb.worksheets
     truncated = False
@@ -63,13 +80,14 @@ def read_xlsx(data: bytes) -> Document:
     wb.close()
     if truncated:
         doc.note(f"Only the first {MAX_ROWS:,} rows of each sheet were converted.")
-    if not doc.tables():
-        raise ConvertError("This spreadsheet is empty.")
     return doc
 
 
+csv.field_size_limit(10_000_000)  # allow very long cells (the default is 128 KB)
+
+
 def read_csv(data: bytes, filename: str = "") -> Document:
-    text = decode_text(data)
+    text = decode_text(data).replace("\x00", "")
     sample = text[:20_000]
     delimiter = "\t" if filename.lower().endswith(".tsv") else ","
     try:
