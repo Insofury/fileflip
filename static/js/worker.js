@@ -34,7 +34,7 @@ async function init() {
   await py.loadPackage(["micropip", "Pillow"]);
   await Promise.all(
     cfg.modules.map(async (path) => {
-      const res = await fetch(`${cfg.site_base}py/${path}`);
+      const res = await fetch(`${cfg.site_base}py/${path}?v=${cfg.version}`); // version: never reuse old code after a deploy
       if (!res.ok) throw new Error(`Missing module ${path}`);
       const dir = `/home/pyodide/${path.split("/").slice(0, -1).join("/")}`;
       py.FS.mkdirTree(dir);
@@ -73,7 +73,7 @@ function ensureFonts() {
       py.FS.mkdirTree("/home/pyodide/app/fonts");
       await Promise.all(
         cfg.fonts.map(async (name) => {
-          const res = await fetch(`${cfg.site_base}py/app/fonts/${name}`);
+          const res = await fetch(`${cfg.site_base}py/app/fonts/${name}?v=${cfg.version}`);
           if (!res.ok) throw new Error(`Missing font ${name}`);
           py.FS.writeFile(`/home/pyodide/app/fonts/${name}`, new Uint8Array(await res.arrayBuffer()));
         }),
